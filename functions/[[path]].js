@@ -4,10 +4,12 @@ const UPSTREAM_FALLBACK = 'https://rhpcv957tj.cloudflare-gateway.com/dns-query';
 const UPSTREAM_GEO_BYPASS = 'https://dns.mullvad.net/dns-query'; // Re-resolve without ECS when geo-block returns loopback
 const UPSTREAM_TIMEOUT = 5000;
 
+// Refresh interval for ALL lists (blocklist, allowlists, private TLDs, redirect rules)
+const ALL_LISTS_REFRESH_INTERVAL = 3600000; // 1 hour
+
 const AD_BLOCK_ENABLED = true;
 const BLOCKLIST_URL = '/rules/blocklists.txt';
 const ALLOWLIST_URL = '/rules/allowlists.txt';
-const BLOCKLIST_REFRESH_INTERVAL = 3600000; // 1 hour
 
 const ECS_INJECTION_ENABLED = true;
 const ECS_PREFIX_V4 = 24;
@@ -27,6 +29,11 @@ const PRIVATE_TLD_URL = '/rules/private_tlds.txt';
 const DNS_REDIRECT_ENABLED = true;
 const REDIRECT_RULES_URL = '/rules/redirect_rules.txt';
 
+// Pre-compiled regex patterns for performance
+const IPV4_MAPPED_REGEX = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i;
+const IPV6_VALID_REGEX = /^[0-9a-f:]+$/i;
+const IPV6_GROUP_REGEX = /^[0-9a-f]+$/i;
+
 // ==================== STATE ====================
 let adBlocklist = new Set();
 let adAllowlist = new Set();
@@ -34,7 +41,7 @@ let privateTlds = new Set();
 let redirectRules = new Map(); // domain → target domain
 let blocklistLastFetch = 0;
 let blocklistPromise = null;
-let stats = { queries: 0, blocked: 0, redirected: 0 };
+let blocklistsFetched = false; // Track if lists have been fetched at least once
 
 // ==================== AD BLOCK ====================
 async function fetchList(url) {
@@ -68,8 +75,10 @@ async function fetchRedirectRules(url) {
 }
 
 async function refreshBlocklists(baseUrl) {
-  if (Date.now() - blocklistLastFetch < BLOCKLIST_REFRESH_INTERVAL &&
-    (adBlocklist.size > 0 || privateTlds.size > 0 || redirectRules.size > 0)) return;
+  // Skip refresh if:
+  // 1. Already fetched at least once AND
+  // 2. Within refresh interval
+  if (blocklistsFetched && Date.now() - blocklistLastFetch < ALL_LISTS_REFRESH_INTERVAL) return;
 
   if (blocklistPromise) return blocklistPromise;
 
@@ -88,11 +97,13 @@ async function refreshBlocklists(baseUrl) {
         DNS_REDIRECT_ENABLED ? fetchRedirectRules(rUrl) : Promise.resolve(new Map())
       ]);
 
-      if (AD_BLOCK_ENABLED && block.size > 0) { adBlocklist = block; adAllowlist = allow; }
-      if (BLOCK_PRIVATE_TLD && privateList.size > 0) { privateTlds = privateList; }
-      if (DNS_REDIRECT_ENABLED && redirRules.size > 0) { redirectRules = redirRules; }
+      // Always update state, even if lists are empty (to prevent infinite re-fetch)
+      if (AD_BLOCK_ENABLED) { adBlocklist = block; adAllowlist = allow; }
+      if (BLOCK_PRIVATE_TLD) { privateTlds = privateList; }
+      if (DNS_REDIRECT_ENABLED) { redirectRules = redirRules; }
 
       blocklistLastFetch = Date.now();
+      blocklistsFetched = true; // Mark as fetched to prevent infinite re-fetch
     } finally { blocklistPromise = null; }
   })();
 
@@ -203,32 +214,35 @@ function hasLoopbackInAnswer(buf) {
 
 function isDomainBlocked(domain) {
   if (!domain || adBlocklist.size === 0) return false;
-  const parts = domain.split('.');
-  // Check allowlist first (exact + parent domains)
-  for (let i = 0; i < parts.length; i++) {
-    if (adAllowlist.has(parts.slice(i).join('.'))) return false;
-  }
-  // Check blocklist (exact + parent domains)
-  for (let i = 0; i < parts.length; i++) {
-    if (adBlocklist.has(parts.slice(i).join('.'))) return true;
-  }
+  
+  // EXACT MATCH ONLY - Check allowlist first (priority)
+  if (adAllowlist.has(domain)) return false;
+  
+  // EXACT MATCH ONLY - Check blocklist
+  if (adBlocklist.has(domain)) return true;
+  
   return false;
 }
 
 // Check if domain matches private TLD list (suffix match)
 function isDomainPrivate(domain) {
   if (!domain || privateTlds.size === 0) return false;
+  
   // Exact match (e.g. query for "localhost" or "192.168.1.1")
   if (privateTlds.has(domain)) return true;
-  // Suffix match: domain ends with .entry (e.g. "mypc.local", "login.routerlogin.com")
-  const parts = domain.split('.');
-  for (let i = 1; i < parts.length; i++) {
-    if (privateTlds.has(parts.slice(i).join('.'))) return true;
+  
+  // Suffix match: efficient with substring + indexOf
+  let pos = 0;
+  while ((pos = domain.indexOf('.', pos)) !== -1) {
+    if (privateTlds.has(domain.substring(pos + 1))) return true;
+    pos++; // Move past the dot
   }
+  
   return false;
 }
 
-// FIX #1: Mirror all query flags (Opcode, AA, TC, RD) per RFC 1035
+// Build NXDOMAIN response (RCODE=3) - Domain does not exist
+// Mirrors query flags (Opcode, AA, TC, RD) per RFC 1035
 function buildNxdomain(query) {
   const v = new Uint8Array(query);
   if (v.length < 12) {
@@ -283,7 +297,6 @@ function buildNodata(query) {
   return res.buffer;
 }
 
-// FIX #7 helper: Build SERVFAIL response mirroring query flags
 function buildServfail(query) {
   const v = new Uint8Array(query);
   if (v.length < 12) {
@@ -311,7 +324,8 @@ function buildServfail(query) {
 }
 
 // ==================== ECS INJECTION ====================
-// FIX #2 + #6: Correct ARCOUNT increment + mask trailing bits per RFC 7871
+// Inject EDNS Client Subnet (ECS) into DNS query per RFC 7871
+// Adds client subnet info for geo-optimized CDN responses
 function injectECS(query, clientIP) {
   if (!ECS_INJECTION_ENABLED || !clientIP || clientIP === 'unknown') return query;
   try {
@@ -322,7 +336,7 @@ function injectECS(query, clientIP) {
     const clean = stripOPT(v);
 
     // Handle IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
-    const ipv4Mapped = clientIP.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+    const ipv4Mapped = clientIP.match(IPV4_MAPPED_REGEX);
     if (ipv4Mapped) clientIP = ipv4Mapped[1];
 
     // Build ECS data
@@ -330,7 +344,7 @@ function injectECS(query, clientIP) {
     if (clientIP.includes(':')) {
       family = 2; prefixLen = ECS_PREFIX_V6;
       const allBytes = ipv6ToBytes(clientIP);
-      if (!allBytes) return query; // FIX #5: invalid IPv6
+      if (!allBytes) return query; // Invalid IPv6 address, skip ECS injection
       const byteLen = Math.ceil(prefixLen / 8);
       addrBytes = allBytes.slice(0, byteLen);
     } else {
@@ -341,7 +355,7 @@ function injectECS(query, clientIP) {
       addrBytes = parts.slice(0, byteLen).map(Number);
     }
 
-    // FIX #6: Mask unused trailing bits in the last byte
+    // Mask unused trailing bits per RFC 7871 (e.g., /24 prefix → mask last byte)
     if (addrBytes.length > 0 && prefixLen % 8 !== 0) {
       const maskBits = prefixLen % 8;
       const mask = (0xFF << (8 - maskBits)) & 0xFF;
@@ -365,7 +379,7 @@ function injectECS(query, clientIP) {
     opt[9] = (ecs.length >> 8) & 0xFF; opt[10] = ecs.length & 0xFF;
     opt.set(ecs, 11);
 
-    // FIX #2: Read current ARCOUNT from stripped buffer, add 1 for new OPT
+    // Increment ARCOUNT to account for new OPT record
     const currentArCount = (clean[10] << 8) | clean[11];
     const newArCount = currentArCount + 1;
 
@@ -378,7 +392,8 @@ function injectECS(query, clientIP) {
   } catch { return query; }
 }
 
-// FIX #3: Validate rdata bounds, use keptRecords.length for ARCOUNT
+// Strip existing OPT (EDNS) records from DNS query
+// Validates rdata bounds and correctly rebuilds ARCOUNT
 function stripOPT(view) {
   let off = 12;
   const qd = (view[4] << 8) | view[5];
@@ -419,7 +434,7 @@ function stripOPT(view) {
     if (arOff + 10 > view.length) break;
     const type = (view[arOff] << 8) | view[arOff + 1];
     const rdlen = (view[arOff + 8] << 8) | view[arOff + 9];
-    // FIX #3: Validate rdata fits in the buffer
+    // Validate rdata length fits within buffer bounds
     if (arOff + 10 + rdlen > view.length) break;
     arOff += 10 + rdlen;
     if (type !== 41) {
@@ -436,17 +451,18 @@ function stripOPT(view) {
     r.set(rec, writeOff);
     writeOff += rec.length;
   }
-  // FIX #3: ARCOUNT = number of kept records (not ar - optDropped)
+  // Set ARCOUNT to number of kept additional records (excluding removed OPT)
   r[10] = (keptRecords.length >> 8) & 0xFF;
   r[11] = keptRecords.length & 0xFF;
   return r;
 }
 
-// FIX #5: Validate IPv6 format, reject invalid input
+// Convert IPv6 address string to 16-byte array
+// Validates format, handles :: compression, rejects invalid input
 function ipv6ToBytes(ip) {
   try {
     if (!ip || typeof ip !== 'string') return null;
-    if (!/^[0-9a-f:]+$/i.test(ip)) return null;
+    if (!IPV6_VALID_REGEX.test(ip)) return null;
 
     const halves = ip.split('::');
     if (halves.length > 2) return null; // Multiple :: is invalid
@@ -458,7 +474,7 @@ function ipv6ToBytes(ip) {
 
     // Validate each group
     for (const g of [...left, ...right]) {
-      if (g.length > 4 || !/^[0-9a-f]+$/i.test(g)) return null;
+      if (g.length > 4 || !IPV6_GROUP_REGEX.test(g)) return null;
     }
 
     const missing = 8 - totalGroups;
@@ -616,7 +632,8 @@ async function forwardQuery(query, upstream) {
   return await res.arrayBuffer();
 }
 
-// FIX #7: Never return loopback to client — return NXDOMAIN instead
+// Resolve DNS query with fallback and geo-bypass logic
+// Returns SERVFAIL on upstream errors, NXDOMAIN for geo-blocked domains
 async function resolveQuery(query, clientIP) {
   const processed = injectECS(query, clientIP);
   let result;
@@ -626,7 +643,7 @@ async function resolveQuery(query, clientIP) {
     try {
       result = await forwardQuery(processed, UPSTREAM_FALLBACK);
     } catch {
-      // Both primary and fallback failed → SERVFAIL
+      // Both primary and fallback upstream failed
       return buildServfail(query);
     }
   }
@@ -636,14 +653,27 @@ async function resolveQuery(query, clientIP) {
     try {
       const respMullvad = await forwardQuery(processed, UPSTREAM_GEO_BYPASS);
       if (!hasLoopbackInAnswer(respMullvad)) return respMullvad;
+      // Mullvad success nhưng vẫn có loopback → geo-block thực sự
+      return buildNxdomain(query);
     } catch {
-      // Mullvad failed
+      // Mullvad upstream failed (timeout or network error)
+      return buildServfail(query);
     }
-    // All upstreams returned loopback or Mullvad failed → NXDOMAIN
-    return buildNxdomain(query);
   }
 
   return result;
+}
+
+// ==================== HELPERS ====================
+// Ensure blocklists are loaded (await on first load, background refresh after)
+async function ensureBlocklistsLoaded(url, context) {
+  if (!blocklistsFetched) {
+    // First time: await to ensure lists are loaded
+    await refreshBlocklists(url);
+  } else if (context) {
+    // Already fetched: background refresh only
+    context.waitUntil(refreshBlocklists(url));
+  }
 }
 
 // ==================== HANDLERS ====================
@@ -661,21 +691,15 @@ async function handleDNSQuery(request, context) {
     if (!dns) return new Response('Missing dns parameter', { status: 400, headers: cors });
     const b64 = dns.replace(/-/g, '+').replace(/_/g, '/');
     const padded = b64 + '=='.slice(0, (4 - b64.length % 4) % 4);
-    const raw = atob(padded);
-    query = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) query[i] = raw.charCodeAt(i);
-    query = query.buffer;
+    query = Uint8Array.from(atob(padded), c => c.charCodeAt(0)).buffer;
   } else {
     return new Response('Method not allowed', { status: 405, headers: cors });
   }
-
-  stats.queries++;
 
   // Block unwanted query types early to save upstream requests
   if (BLOCKED_QTYPES.size > 0) {
     const qtype = extractQtype(query);
     if (qtype !== null && BLOCKED_QTYPES.has(qtype)) {
-      stats.blocked++;
       return new Response(buildNodata(query), {
         headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Blocked-Type': String(qtype) }
       });
@@ -684,11 +708,7 @@ async function handleDNSQuery(request, context) {
 
   // Load data if any domain-based filter is enabled
   if (AD_BLOCK_ENABLED || BLOCK_PRIVATE_TLD || DNS_REDIRECT_ENABLED) {
-    if ((AD_BLOCK_ENABLED && adBlocklist.size === 0) || (BLOCK_PRIVATE_TLD && privateTlds.size === 0) || (DNS_REDIRECT_ENABLED && redirectRules.size === 0)) {
-      await refreshBlocklists(request.url);
-    } else {
-      context.waitUntil(refreshBlocklists(request.url));
-    }
+    await ensureBlocklistsLoaded(request.url, context);
 
     // Parse domains once for both filters
     const domains = extractAllDomains(query);
@@ -697,7 +717,6 @@ async function handleDNSQuery(request, context) {
 
       // Private TLD check (NXDOMAIN)
       if (BLOCK_PRIVATE_TLD && isDomainPrivate(domain)) {
-        stats.blocked++;
         return new Response(buildNxdomain(query), {
           headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Blocked-Private': domain }
         });
@@ -705,7 +724,6 @@ async function handleDNSQuery(request, context) {
 
       // Ad block check (NXDOMAIN)
       if (AD_BLOCK_ENABLED && isDomainBlocked(domain)) {
-        stats.blocked++;
         return new Response(buildNxdomain(query), {
           headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Blocked': domain }
         });
@@ -718,7 +736,6 @@ async function handleDNSQuery(request, context) {
           const rewritten = rewriteQname(query, targetDomain);
           const upstreamData = await resolveQuery(rewritten, clientIP);
           const redirected = buildRedirectResponse(query, upstreamData, domain, targetDomain);
-          stats.redirected++;
           return new Response(redirected, {
             headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Redirected': `${domain} -> ${targetDomain}` }
           });
@@ -748,11 +765,7 @@ async function handleRequest(request, context) {
 
   if (path === '/debug') {
     if (AD_BLOCK_ENABLED || BLOCK_PRIVATE_TLD || DNS_REDIRECT_ENABLED) {
-      if ((AD_BLOCK_ENABLED && adBlocklist.size === 0) || (BLOCK_PRIVATE_TLD && privateTlds.size === 0) || (DNS_REDIRECT_ENABLED && redirectRules.size === 0)) {
-        await refreshBlocklists(request.url);
-      } else {
-        context.waitUntil(refreshBlocklists(request.url));
-      }
+      await ensureBlocklistsLoaded(request.url, context);
     }
     return new Response(JSON.stringify({
       upstreams: { primary: UPSTREAM_PRIMARY, fallback: UPSTREAM_FALLBACK, geoBypass: UPSTREAM_GEO_BYPASS },
@@ -760,8 +773,7 @@ async function handleRequest(request, context) {
       ecs: { enabled: ECS_INJECTION_ENABLED, prefixV4: `/${ECS_PREFIX_V4}`, prefixV6: `/${ECS_PREFIX_V6}` },
       blockedTypes: { ANY: BLOCK_ANY, AAAA: BLOCK_AAAA, PTR: BLOCK_PTR, HTTPS: BLOCK_HTTPS },
       privateTld: { enabled: BLOCK_PRIVATE_TLD, entries: privateTlds.size },
-      dnsRedirect: { enabled: DNS_REDIRECT_ENABLED, rules: redirectRules.size },
-      stats
+      dnsRedirect: { enabled: DNS_REDIRECT_ENABLED, rules: redirectRules.size }
     }, null, 2), { headers: { 'Content-Type': 'application/json' } });
   }
 
